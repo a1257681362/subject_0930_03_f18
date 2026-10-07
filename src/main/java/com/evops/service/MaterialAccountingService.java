@@ -22,6 +22,7 @@ import com.evops.mapper.MaterialReturnMapper;
 import com.evops.mapper.MaterialReviewMapper;
 import com.evops.mapper.MaterialUsageLineMapper;
 import com.evops.mapper.MaterialUsageMapper;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -374,20 +375,43 @@ public class MaterialAccountingService {
      * 退料：必须指定原领用单与原明细行，库存加回原批号；
      * 可分次退，累计不得超过该行实际用量。退料只追加，不改写原领用/差异事实。
      * 所有行均退齐时整单置 RETURNED。
+     *
+     * <p>幂等与事务边界：退料单号（returnNo）全库唯一，是重复点击/接口重试/
+     * 异常重放的幂等锚点。同一单号重发命中已生效退料单时原样回放——原始
+     * 操作人、原台账摘要都保持首次提交的事实，不重复加回库存、不重复写台账；
+     * 单号相同但请求要素（领用单/明细行/数量）不一致时拒绝，已生效退料
+     * 不被覆盖。同一领用单的并发退料凭行锁串行化，锁内回读最新累计退料量；
+     * 退料单插入、库存加回、领用单状态推进、台账追加在同一事务内提交，
+     * 任一步失败整体回滚，仓管重试可安全重放。</p>
      */
     @Transactional
     public MaterialReturn returnMaterial(MaterialReturnRequest req) {
+        BigDecimal qty = req.getReturnQty();
+        if (qty == null || qty.signum() <= 0) {
+            throw new IllegalArgumentException("退料数量必须大于 0");
+        }
+        // 快速路径：同一退料单号重发/重复点击，直接回放原退料单，不产生第二次冲销
+        MaterialReturn existing = findByReturnNo(req.getReturnNo());
+        if (existing != null) {
+            return replayReturn(existing, req);
+        }
+
         MaterialUsage usage = usageMapper.selectById(req.getUsageId());
         if (usage == null) {
             throw new IllegalArgumentException("原领用单不存在: id=" + req.getUsageId());
         }
+        // 领用单行锁：同一领用单的并发退料在此串行，锁内回读拿到最新累计退料量
+        usageMapper.lockRow(usage.getId());
+
+        // 锁内二次回读：并发重试在锁等待后命中同一条已生效退料单
+        MaterialReturn raced = findByReturnNo(req.getReturnNo());
+        if (raced != null) {
+            return replayReturn(raced, req);
+        }
+
         MaterialUsageLine line = lineMapper.selectById(req.getLineId());
         if (line == null || !line.getUsageId().equals(usage.getId())) {
             throw new IllegalArgumentException("退料明细行不属于该原领用单");
-        }
-        BigDecimal qty = req.getReturnQty();
-        if (qty == null || qty.signum() <= 0) {
-            throw new IllegalArgumentException("退料数量必须大于 0");
         }
         BigDecimal returned = sumReturned(line.getId());
         if (returned.add(qty).compareTo(line.getActualQty()) > 0) {
@@ -408,7 +432,16 @@ public class MaterialAccountingService {
         ret.setReason(req.getReason());
         ret.setReturnedBy(req.getReturnedBy());
         ret.setReturnedAt(now);
-        returnMapper.insert(ret);
+        try {
+            returnMapper.insert(ret);
+        } catch (DuplicateKeyException e) {
+            // 并发兜底：退料单号已被另一事务生效——回放原单，不重复加回库存
+            MaterialReturn committed = findByReturnNo(req.getReturnNo());
+            if (committed != null) {
+                return replayReturn(committed, req);
+            }
+            throw new IllegalArgumentException("退料单号已存在: " + req.getReturnNo());
+        }
 
         batchMapper.addStock(line.getBatchId(), qty);
 
@@ -433,6 +466,26 @@ public class MaterialAccountingService {
                         + "，部位 " + line.getApplyPart()
                         + "（原操作者：" + line.getOperator() + "）", now);
         return ret;
+    }
+
+    /** 按退料单号回读已生效退料单（重复点击/接口重试/异常重放的幂等锚点） */
+    public MaterialReturn findByReturnNo(String returnNo) {
+        return returnMapper.selectOne(new LambdaQueryWrapper<MaterialReturn>()
+                .eq(MaterialReturn::getReturnNo, returnNo));
+    }
+
+    /**
+     * 同一退料单号只允许对应同一请求要素：一致则幂等回放原单（原始操作人、
+     * 原台账摘要保持首次生效的事实），不一致说明单号被挪用，拒绝重复生效。
+     */
+    private MaterialReturn replayReturn(MaterialReturn existing, MaterialReturnRequest req) {
+        if (!existing.getUsageId().equals(req.getUsageId())
+                || !existing.getLineId().equals(req.getLineId())
+                || existing.getReturnQty().compareTo(req.getReturnQty()) != 0) {
+            throw new IllegalArgumentException("退料单号已存在且与已生效退料单不一致，不能重复生效: "
+                    + req.getReturnNo());
+        }
+        return existing;
     }
 
     // ------------------------------------------------------------------
