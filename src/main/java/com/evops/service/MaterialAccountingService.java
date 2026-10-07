@@ -22,11 +22,15 @@ import com.evops.mapper.MaterialReturnMapper;
 import com.evops.mapper.MaterialReviewMapper;
 import com.evops.mapper.MaterialUsageLineMapper;
 import com.evops.mapper.MaterialUsageMapper;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.Arrays;
@@ -374,9 +378,26 @@ public class MaterialAccountingService {
      * 退料：必须指定原领用单与原明细行，库存加回原批号；
      * 可分次退，累计不得超过该行实际用量。退料只追加，不改写原领用/差异事实。
      * 所有行均退齐时整单置 RETURNED。
+     *
+     * <p>幂等边界（退料单号即幂等键）：</p>
+     * <ol>
+     *   <li>仓管重试/双击/异常重放复用同一退料单号且内容一致时，命中已生效记录并
+     *       原样回放——不重复加回库存、不重复写台账，原操作人与首次请求摘要保持不变；</li>
+     *   <li>同单号不同内容（数量/明细行/操作者任一不符）视为单号冲突，明确报错，
+     *       绝不静默生效第二次；</li>
+     *   <li>领用单行锁把同一领用单的并发退料串行化，累计退料校验在锁内重算，
+     *       杜绝并发下合计超退、库存重复加回；</li>
+     *   <li>退料行、库存加回、整单状态、台账在同一事务提交，任一步失败整体回滚。</li>
+     * </ol>
      */
     @Transactional
     public MaterialReturn returnMaterial(MaterialReturnRequest req) {
+        // 快路径：凭退料单号幂等回读，已生效的退料绝不重复生效
+        MaterialReturn existing = findReturnByNo(req.getReturnNo());
+        if (existing != null) {
+            return replayOrConflict(existing, req);
+        }
+
         MaterialUsage usage = usageMapper.selectById(req.getUsageId());
         if (usage == null) {
             throw new IllegalArgumentException("原领用单不存在: id=" + req.getUsageId());
@@ -389,6 +410,17 @@ public class MaterialAccountingService {
         if (qty == null || qty.signum() <= 0) {
             throw new IllegalArgumentException("退料数量必须大于 0");
         }
+
+        // 领用单行锁：同一领用单的并发退料在此串行，先提交者生效
+        usageMapper.lockRow(usage.getId());
+
+        // 锁内二次回读：同单号的并发重试在锁等待后命中同一条已生效记录
+        MaterialReturn raced = findReturnByNo(req.getReturnNo());
+        if (raced != null) {
+            return replayOrConflict(raced, req);
+        }
+
+        // 锁内重算累计退料：与并发对端的校验-写入不再交错，合计不会超退
         BigDecimal returned = sumReturned(line.getId());
         if (returned.add(qty).compareTo(line.getActualQty()) > 0) {
             throw new IllegalArgumentException("累计退料不能超过该行实际用量 "
@@ -408,7 +440,17 @@ public class MaterialAccountingService {
         ret.setReason(req.getReason());
         ret.setReturnedBy(req.getReturnedBy());
         ret.setReturnedAt(now);
-        returnMapper.insert(ret);
+        ret.setRequestDigest(returnDigest(req));
+        try {
+            returnMapper.insert(ret);
+        } catch (DuplicateKeyException e) {
+            // 唯一约束兜底：跨领用单复用同一单号的极端并发在此收口
+            MaterialReturn winner = findReturnByNo(req.getReturnNo());
+            if (winner != null) {
+                return replayOrConflict(winner, req);
+            }
+            throw new IllegalArgumentException("退料单号已存在: " + req.getReturnNo());
+        }
 
         batchMapper.addStock(line.getBatchId(), qty);
 
@@ -548,8 +590,75 @@ public class MaterialAccountingService {
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
+    /** 按退料单号回读已生效退料（幂等键） */
+    private MaterialReturn findReturnByNo(String returnNo) {
+        if (returnNo == null || returnNo.isEmpty()) {
+            return null;
+        }
+        return returnMapper.selectOne(new LambdaQueryWrapper<MaterialReturn>()
+                .eq(MaterialReturn::getReturnNo, returnNo)
+                .last("LIMIT 1"));
+    }
+
+    /**
+     * 命中已生效退料：内容一致即幂等回放原记录（不加库存、不写台账、不改操作者）；
+     * 内容不一致说明单号被另一笔退料占用，明确冲突报错，绝不静默生效第二次。
+     * 历史遗留行没有请求摘要时退化为逐字段比对，判定口径一致。
+     */
+    private MaterialReturn replayOrConflict(MaterialReturn existing, MaterialReturnRequest req) {
+        boolean same = existing.getRequestDigest() != null
+                ? returnDigest(req).equals(existing.getRequestDigest())
+                : sameContent(existing, req);
+        if (same) {
+            return existing;
+        }
+        throw new IllegalArgumentException("退料单号已存在且请求内容不一致: " + req.getReturnNo()
+                + "（原退料 " + existing.getReturnQty() + "，操作者 " + existing.getReturnedBy()
+                + "；本次 " + req.getReturnQty() + "，操作者 " + req.getReturnedBy() + "）");
+    }
+
+    /** 无摘要历史行的内容比对：领用单、明细行、数量、操作者全部一致才视为同一请求 */
+    private static boolean sameContent(MaterialReturn existing, MaterialReturnRequest req) {
+        return existing.getUsageId().equals(req.getUsageId())
+                && existing.getLineId().equals(req.getLineId())
+                && existing.getReturnQty().compareTo(req.getReturnQty()) == 0
+                && java.util.Objects.equals(existing.getReturnedBy(), req.getReturnedBy());
+    }
+
+    /**
+     * 请求摘要：单号 + 原领用单 + 明细行 + 数量 + 操作者 + 事由 的 SHA-256。
+     * 数量先去掉尾零再参与摘要，3 与 3.00 视为同一请求。
+     */
+    private static String returnDigest(MaterialReturnRequest req) {
+        String qty = req.getReturnQty() == null ? ""
+                : req.getReturnQty().stripTrailingZeros().toPlainString();
+        String raw = String.join("|",
+                nz(req.getReturnNo()),
+                String.valueOf(req.getUsageId()),
+                String.valueOf(req.getLineId()),
+                qty,
+                nz(req.getReturnedBy()),
+                nz(req.getReason()));
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(raw.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
+        }
+    }
+
     private static BigDecimal nz(BigDecimal v) {
         return v == null ? BigDecimal.ZERO : v;
+    }
+
+    private static String nz(String v) {
+        return v == null ? "" : v;
     }
 
     private String joinBatchNos(List<UsageLineRequest> lines) {
